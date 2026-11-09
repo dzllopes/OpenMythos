@@ -1,7 +1,9 @@
-torch>=2.1.0
-transformers>=4.40.0
-datasets>=2.18.0
-pytest>=7.0.0
+# Pisos de versão = mínimos seguros aceitáveis. As versões exatas testadas ficam
+# em requirements.lock (instale com: pip install -r requirements.lock).
+torch>=2.6.0          # 2.6 tornou weights_only=True o padrão de torch.load (ver Achado 1)
+transformers>=4.48.0
+datasets>=2.20.0
+pytest>=8.0.0
 
 # optional — enables Flash Attention 2 in GQAttention (requires CUDA + build tools)
 # flash-attn>=2.8.3
