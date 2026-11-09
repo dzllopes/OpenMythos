@@ -30,9 +30,16 @@ from contextlib import nullcontext
 from datasets import load_dataset
 
 from open_mythos import OpenMythos
-from open_mythos.main import TransformerBlock, RecurrentBlock
+from open_mythos.main import TransformerBlock, RecurrentBlock, MythosConfig
 from open_mythos.variants import mythos_3b
 from open_mythos.tokenizer import MythosTokenizer
+
+# Segurança (desserialização de checkpoints): os arquivos step_*.pt embutem a
+# dataclass `cfg` (MythosConfig), então eles são carregados com weights_only=True
+# e SOMENTE MythosConfig é liberada na allowlist do unpickler. Isso impede que um
+# checkpoint adulterado execute código arbitrário no torch.load (ex.: os.system via
+# __reduce__), sem alterar o formato em disco nem o round-trip de save/load.
+torch.serialization.add_safe_globals([MythosConfig])
 
 
 # ---------------------------------------------------------------------------
@@ -266,9 +273,11 @@ def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
     and optimizer loads across two `state_dict_type` blocks has historically
     produced optimizer state bound to the wrong shard shapes.
 
-    `weights_only=False` is required because the checkpoint contains the
-    pickled `cfg` dataclass — flip to `weights_only=True` only if you
-    separate config out.
+    The checkpoint embeds the `cfg` dataclass, so it is loaded with
+    `weights_only=True` while allowlisting `MythosConfig` (see the
+    `add_safe_globals` call near the imports). This restores the pickled
+    config but blocks arbitrary-code execution from a tampered checkpoint,
+    since only that one class — not arbitrary callables — may be unpickled.
 
     Args:
         model     -- same FSDP-wrapped or raw model used during save
@@ -281,7 +290,7 @@ def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
         The step number the checkpoint was taken at; the caller advances the
         training loop from this value.
     """
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
 
     if ddp:
         with FSDP.state_dict_type(
