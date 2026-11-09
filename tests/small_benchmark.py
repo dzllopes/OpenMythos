@@ -347,6 +347,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--text-field", default="text")
     p.add_argument("--tokenizer", default="gpt2")
+    # Cadeia de suprimentos: pin opcional de revisão no Hub (commit SHA ou tag).
+    # None = última versão (comportamento padrão). Passe para fixar e reproduzir.
+    p.add_argument("--tokenizer-revision", default=None)
+    p.add_argument("--dataset-revision", default=None)
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument(
         "--eval-every",
@@ -368,11 +372,14 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_text_ds(name: str, config: str, split: str):
-    """Streaming `load_dataset` with optional config (empty string == no config)."""
+def load_text_ds(name: str, config: str, split: str, revision: str | None = None):
+    """Streaming `load_dataset` with optional config (empty string == no config).
+
+    `revision` pins a Hub commit SHA/tag for supply-chain safety; None = latest.
+    """
     if config:
-        return load_dataset(name, config, split=split, streaming=True)
-    return load_dataset(name, split=split, streaming=True)
+        return load_dataset(name, config, split=split, streaming=True, revision=revision)
+    return load_dataset(name, split=split, streaming=True, revision=revision)
 
 
 def main() -> None:
@@ -384,7 +391,7 @@ def main() -> None:
         f"seq_len={args.seq_len}  steps={args.steps}"
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, revision=args.tokenizer_revision)
     # AutoTokenizer.vocab_size can be smaller than the head size for BPE
     # tokenizers with added tokens; use len(tokenizer) to be safe.
     vocab_size = len(tokenizer)
@@ -394,11 +401,11 @@ def main() -> None:
     # Data: streamed train + held-out eval splits
     # ------------------------------------------------------------------
     print(f"[setup] dataset={args.dataset}  config={args.dataset_config or '∅'}")
-    raw_train = load_text_ds(args.dataset, args.dataset_config, args.train_split)
+    raw_train = load_text_ds(args.dataset, args.dataset_config, args.train_split, args.dataset_revision)
     train_ds = PackedLMDataset(
         raw_train, tokenizer, args.seq_len, args.train_tokens, args.text_field
     )
-    raw_eval = load_text_ds(args.dataset, args.dataset_config, args.eval_split)
+    raw_eval = load_text_ds(args.dataset, args.dataset_config, args.eval_split, args.dataset_revision)
     eval_ds = PackedLMDataset(
         raw_eval, tokenizer, args.seq_len, args.eval_tokens, args.text_field
     )

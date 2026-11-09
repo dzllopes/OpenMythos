@@ -101,6 +101,10 @@ class FineWebEduDataset(IterableDataset):
             name=self.subset,
             split="train",
             streaming=True,
+            # Cadeia de suprimentos: fixa o commit do dataset no Hub (resolvido em
+            # 2026-11-09) para não puxar dados alterados upstream. Atualize ao
+            # mudar de versão do dataset.
+            revision="87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
         ).shard(num_shards=total_shards, index=shard_index)
 
         buf = []

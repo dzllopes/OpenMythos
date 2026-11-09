@@ -1,6 +1,11 @@
 from transformers import AutoTokenizer
 
 DEFAULT_MODEL_ID = "openai/gpt-oss-20b"
+# Cadeia de suprimentos: fixa o commit do repо no Hub, para não baixar conteúdo
+# alterado upstream (conta comprometida, rename, etc.). Resolvido em 2026-11-09;
+# atualize junto com DEFAULT_MODEL_ID. Vale só para o modelo padrão — um model_id
+# customizado usa a última revisão (revision=None), como antes.
+DEFAULT_REVISION = "6cee5e81ee83917806bbde320786a8fb61efebee"
 
 
 class MythosTokenizer:
@@ -20,14 +25,19 @@ class MythosTokenizer:
         >>> s = tok.decode(ids)
     """
 
-    def __init__(self, model_id: str = DEFAULT_MODEL_ID):
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, revision: str | None = None):
         """
         Initialize the MythosTokenizer.
 
         Args:
             model_id (str): HuggingFace model identifier or path to tokenizer files.
+            revision (str | None): Hub revision (commit SHA/tag) to pin. When None
+                and model_id is the default, pins DEFAULT_REVISION for supply-chain
+                safety; for a custom model_id, None means the latest revision.
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if revision is None and model_id == DEFAULT_MODEL_ID:
+            revision = DEFAULT_REVISION
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
 
     @property
     def vocab_size(self) -> int:
