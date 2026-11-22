@@ -121,7 +121,7 @@ from open_mythos import (
     OpenMythos,
 )
 
-cfg = mythos_7b()  # returns a MythosConfig
+cfg = mythos_3b()  # returns a MythosConfig
 model = OpenMythos(cfg)
 
 total = sum(p.numel() for p in model.parameters())
@@ -161,7 +161,10 @@ Key design choices:
 | Optimizer | AdamW |
 | Dataset | `HuggingFaceFW/fineweb-edu` (`sample-10BT` by default, swap to `sample-100BT` or `default` for full run) |
 | Tokenizer | `openai/gpt-oss-20b` via `MythosTokenizer` |
-| Parallelism | PyTorch DDP via `torchrun`, sharded streaming dataset |
+| Parallelism | PyTorch FSDP (`FULL_SHARD`) via `torchrun`, sharded streaming dataset |
+| Recurrent depth | `n_loops` sampled uniformly in `[4, max_loop_iters]` each step (trains depth extrapolation) |
+| MoE balancing | Aux-loss-free router-bias update after every optimizer step (DeepSeek-V3) |
+| Validation | 1% of documents held out by id hash; val loss / perplexity logged every 500 steps |
 | Precision | bfloat16 on H100/A100, float16 + GradScaler on older GPUs |
 | Schedule | Linear warmup (2000 steps) → cosine decay |
 | Target | 30B tokens (~Chinchilla-adjusted for looped architecture) |
@@ -174,6 +177,7 @@ Key design choices:
 |---|---|
 | [`docs/open_mythos.md`](docs/open_mythos.md) | Full API reference for the `OpenMythos` class — constructor, `forward`, `generate`, all sub-modules, configuration reference, and usage examples |
 | [`docs/datasets.md`](docs/datasets.md) | Recommended training datasets with token budget guidance per model size |
+| [`examples/moda_example.py`](examples/moda_example.py) | `MoDAModel` (`open_mythos.moda`): a separate, non-looped Mixture-of-Depths Attention + DeepSeekMoE model, exported as `from open_mythos import MoDAConfig, MoDAModel` |
 
 ---
 
