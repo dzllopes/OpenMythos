@@ -299,7 +299,7 @@ h = LTIInjection(h, e, trans_out)               # stable update: A·h + B·e + t
 p = ACTHalting(h)                                # per-position halting probability
 ```
 
-The loop exits early for positions whose cumulative halting probability exceeds `cfg.act_threshold`. If all positions have halted, the loop exits before `n_loops`. The final output is an ACT-weighted sum of `h` across iterations.
+The loop exits early for positions whose cumulative halting probability exceeds `cfg.act_threshold`. If all positions have halted, the loop exits before `n_loops`. The final output is an ACT-weighted sum of `h` across iterations. On the last iteration every position that has not halted yet receives its full remaining probability mass, so each position's weights always sum to 1 (the output keeps the scale of `h` even when `n_loops` is small).
 
 ### `LTIInjection`
 
@@ -348,7 +348,7 @@ Grouped Query Attention ([Ainslie et al., 2023](https://arxiv.org/abs/2305.13245
 
 Fine-grained Mixture-of-Experts FFN ([DeepSeekMoE, Dai et al., 2024](https://arxiv.org/abs/2401.06066)):
 
-- **Routed experts:** `n_experts` small SwiGLU FFNs. Each token's router selects the top-`n_experts_per_tok` via softmax over learned logits. A per-expert bias `router_bias` (non-gradient, updated externally) keeps load balanced.
+- **Routed experts:** `n_experts` small SwiGLU FFNs. Each token's router selects the top-`n_experts_per_tok` via softmax over learned logits. A per-expert bias `router_bias` (non-gradient) keeps load balanced: in training mode each MoE layer counts how many tokens each expert received, and `OpenMythos.update_router_biases(rate)` — called after every `optimizer.step()` — raises the bias of under-used experts and lowers it for over-used ones by `rate` (aux-loss-free balancing, DeepSeek-V3). Counts are all-reduced across ranks under `torch.distributed`.
 - **Shared experts:** `n_shared_experts` always-active FFNs with width `expert_dim × n_experts_per_tok`, absorbing cross-domain patterns.
 
 Total activated parameters per token: `(n_experts_per_tok / n_experts)` of routed capacity + all shared capacity.

@@ -483,6 +483,11 @@ class MoEFFN(nn.Module):
         self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
         # load-balancing bias adjusted externally during training; not a gradient param
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
+        # per-expert token counts accumulated during training forward passes;
+        # consumed (and reset) by update_router_bias() after each optimizer step
+        self.register_buffer(
+            "expert_load", torch.zeros(cfg.n_experts), persistent=False
+        )
 
         self.routed_experts = nn.ModuleList(
             [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
@@ -515,22 +520,62 @@ class MoEFFN(nn.Module):
         topk_scores = scores.gather(-1, topk_idx)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
 
-        # routed expert dispatch (token-level scatter)
+        if self.training:
+            with torch.no_grad():
+                self.expert_load += torch.bincount(
+                    topk_idx.flatten(), minlength=self.n_experts
+                ).to(self.expert_load.dtype)
+
+        # routed expert dispatch: sort the (token, slot) assignments by expert
+        # once, then run each expert on its contiguous slice. One pass over the
+        # experts (instead of top-K × n_experts boolean masks over all tokens).
         out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        flat_expert = topk_idx.flatten()  # (B*T*K,)
+        flat_token = torch.arange(
+            flat.shape[0], device=flat.device
+        ).repeat_interleave(self.topk)
+        flat_score = topk_scores.flatten()
+        order = flat_expert.argsort(stable=True)
+        sorted_expert = flat_expert[order]
+        sorted_token = flat_token[order]
+        sorted_score = flat_score[order]
+        counts = torch.bincount(sorted_expert, minlength=self.n_experts).tolist()
+        offset = 0
+        for eid, n in enumerate(counts):
+            if n == 0:
+                continue
+            tok = sorted_token[offset : offset + n]
+            y = self.routed_experts[eid](flat[tok])
+            out.index_add_(0, tok, y * sorted_score[offset : offset + n, None].to(y.dtype))
+            offset += n
 
         # shared experts always fire for every token
         for shared in self.shared_experts:
             out = out + shared(flat)
 
         return out.view(B, T, D)
+
+    @torch.no_grad()
+    def update_router_bias(self, rate: float = 1e-3) -> None:
+        """
+        Aux-loss-free load balancing step (DeepSeek-V3, §2.1.2).
+
+        Call once after every optimizer step. Experts that received more than
+        the mean number of tokens since the last call get their bias lowered by
+        `rate`, under-used experts get it raised. The accumulated counts are
+        then reset. Under torch.distributed the counts are all-reduced first so
+        every rank applies the same update and the biases stay in sync.
+
+        Args:
+            rate -- bias update speed (gamma in the DeepSeek-V3 paper)
+        """
+        load = self.expert_load.float()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(load)
+        if load.sum() > 0:
+            err = load.mean() - load  # > 0 → under-loaded → raise bias
+            self.router_bias += (rate * err.sign()).to(self.router_bias.dtype)
+        self.expert_load.zero_()
 
 
 # ---------------------------------------------------------------------------
@@ -874,9 +919,14 @@ class RecurrentBlock(nn.Module):
             # Gate by still_running so halted positions contribute exactly
             # once (on the halting step) and zero thereafter — otherwise
             # threshold<1 leaves a non-zero remainder that leaks every step.
+            # On the final iteration every still-running position receives its
+            # full remainder, so the ACT weights of each position sum to 1 and
+            # h_out keeps the scale of h even when n_loops is too small for the
+            # position to cross the threshold on its own.
             remainder = (1.0 - cumulative_p).clamp(min=0)
+            is_last = t == n_loops - 1
             weight = torch.where(
-                cumulative_p + p >= self.cfg.act_threshold,
+                (cumulative_p + p >= self.cfg.act_threshold) | is_last,
                 remainder,
                 p,
             )
@@ -1036,6 +1086,18 @@ class OpenMythos(nn.Module):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
 
         return self.head(self.norm(x))
+
+    @torch.no_grad()
+    def update_router_biases(self, rate: float = 1e-3) -> None:
+        """
+        Apply one aux-loss-free load-balancing step to every MoE layer.
+
+        Call after each optimizer.step() during training; see
+        MoEFFN.update_router_bias for details.
+        """
+        for m in self.modules():
+            if isinstance(m, MoEFFN):
+                m.update_router_bias(rate)
 
     @torch.no_grad()
     def generate(

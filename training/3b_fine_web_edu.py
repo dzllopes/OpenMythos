@@ -11,7 +11,9 @@ Multi-GPU:
 
 import os
 import math
+import random
 import time
+import zlib
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -63,7 +65,16 @@ class FineWebEduDataset(IterableDataset):
     cost of a true resumable loader.
     """
 
-    def __init__(self, encoding, seq_len: int, subset: str, rank: int, world_size: int):
+    def __init__(
+        self,
+        encoding,
+        seq_len: int,
+        subset: str,
+        rank: int,
+        world_size: int,
+        role: str = "train",
+        val_mod: int = 100,
+    ):
         """
         Args:
             encoding   -- tokenizer exposing `.encode(str) -> list[int]`
@@ -71,12 +82,25 @@ class FineWebEduDataset(IterableDataset):
             subset     -- FineWeb-Edu config name (e.g. "sample-10BT", "default")
             rank       -- global rank of this process within the distributed job
             world_size -- total number of distributed processes
+            role       -- "train" or "val". Documents are split deterministically
+                          by a CRC32 of their `id`: one in `val_mod` goes to
+                          validation, the rest to training, so the two sets
+                          never overlap.
+            val_mod    -- 1/val_mod of the documents are held out for validation
         """
+        if role not in ("train", "val"):
+            raise ValueError(f"role must be 'train' or 'val', got {role!r}")
         self.encoding = encoding
         self.seq_len = seq_len
         self.subset = subset
         self.rank = rank
         self.world_size = world_size
+        self.role = role
+        self.val_mod = val_mod
+
+    def _is_val(self, sample) -> bool:
+        key = sample.get("id") or sample["text"][:256]
+        return zlib.crc32(key.encode("utf-8")) % self.val_mod == 0
 
     def __iter__(self):
         """
@@ -108,7 +132,10 @@ class FineWebEduDataset(IterableDataset):
         ).shard(num_shards=total_shards, index=shard_index)
 
         buf = []
+        want_val = self.role == "val"
         for sample in ds:
+            if self._is_val(sample) != want_val:
+                continue
             buf.extend(self.encoding.encode(sample["text"]))
             while len(buf) >= self.seq_len + 1:
                 chunk = buf[: self.seq_len + 1]
@@ -317,6 +344,56 @@ def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Recurrent depth sampling + evaluation
+# ---------------------------------------------------------------------------
+
+
+def sample_n_loops(step: int, min_loops: int, max_loops: int) -> int:
+    """
+    Recurrent depth for one optimizer step, uniform in [min_loops, max_loops].
+
+    Training on a range of depths (instead of always max_loops) is what teaches
+    the recurrent block to be useful at any depth, which in turn is what lets
+    inference run *more* loops than seen in training (depth extrapolation).
+    The RNG is seeded with the step so every rank picks the same depth without
+    communication, and a resumed run replays the same depth schedule.
+    """
+    return random.Random(step).randint(min_loops, max_loops)
+
+
+@torch.no_grad()
+def evaluate(model, batches, vocab_size: int, n_loops: int, device, amp_ctx, ddp: bool):
+    """
+    Mean next-token cross-entropy on a fixed set of held-out batches.
+
+    Every rank evaluates its own validation batches (FSDP needs all ranks in
+    each forward); the per-rank means are averaged with an all-reduce.
+
+    Returns:
+        (loss, perplexity) as Python floats
+    """
+    was_training = model.training
+    model.eval()
+    total = torch.zeros(2, device=device)
+    for x, y in batches:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        with amp_ctx:
+            logits = model(x, n_loops=n_loops)
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, vocab_size).float(), y.view(-1)
+            )
+        total[0] += loss
+        total[1] += 1
+    if ddp:
+        dist.all_reduce(total)
+    if was_training:
+        model.train()
+    mean = (total[0] / total[1].clamp(min=1)).item()
+    return mean, math.exp(min(mean, 20.0))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -397,6 +474,16 @@ def main():
     ckpt_every = 1000
     ckpt_dir = "checkpoints"
     dataset_subset = "sample-10BT"  # → sample-100BT or "default" for full run
+    # Recurrent depth: each step samples n_loops uniformly in this range
+    # (max_loops is set from cfg.max_loop_iters once the config exists).
+    min_loops = 4
+    # Aux-loss-free MoE load balancing (DeepSeek-V3 bias update speed)
+    router_bias_rate = 1e-3
+    # Validation: 1/val_mod of documents are held out; eval_batches micro-batches
+    # per rank are cached once and re-scored every eval_every steps.
+    val_mod = 100
+    eval_every = 500
+    eval_batches = 20
 
     if master:
         logger.info(
@@ -410,6 +497,8 @@ def main():
     cfg = mythos_3b()
     cfg.vocab_size = vocab_size
     cfg.max_seq_len = seq_len
+    max_loops = cfg.max_loop_iters
+    min_loops = min(min_loops, max_loops)
 
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
@@ -420,7 +509,11 @@ def main():
         mp_policy = MixedPrecision(
             param_dtype=amp_dtype,
             reduce_dtype=amp_dtype,
-            buffer_dtype=amp_dtype,
+            # Buffers stay fp32: the RoPE tables are complex64 (casting them to
+            # bf16 would drop the imaginary part) and the MoE router_bias /
+            # expert_load buffers need fp32 so 1e-3 bias steps and token
+            # counts are not rounded away.
+            buffer_dtype=torch.float32,
         )
         wrap_policy = ModuleWrapPolicy({TransformerBlock, RecurrentBlock})
         model = FSDP(
@@ -474,6 +567,24 @@ def main():
     dataset = FineWebEduDataset(encoding, seq_len, dataset_subset, rank, world_size)
     loader = DataLoader(dataset, batch_size=micro_batch, num_workers=4, pin_memory=True)
 
+    # Held-out validation batches, collected once and reused for every eval so
+    # successive val losses are directly comparable.
+    val_dataset = FineWebEduDataset(
+        encoding, seq_len, dataset_subset, rank, world_size, role="val", val_mod=val_mod
+    )
+    val_batches = []
+    for xb, yb in DataLoader(val_dataset, batch_size=micro_batch, num_workers=0):
+        val_batches.append((xb, yb))
+        if len(val_batches) >= eval_batches:
+            break
+    if master:
+        logger.info(
+            f"Validation: {len(val_batches)} batches/rank (1/{val_mod} of docs held out) "
+            f"| loops per step ∈ [{min_loops}, {max_loops}]"
+        )
+    raw_model = model.module if ddp else model
+    eval_device = f"cuda:{local_rank}" if ddp else device
+
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
@@ -492,6 +603,7 @@ def main():
 
         optimizer.zero_grad()
         loss_accum = 0.0
+        n_loops = sample_n_loops(step, min_loops, max_loops)
 
         for micro_step in range(grad_accum):
             try:
@@ -509,7 +621,7 @@ def main():
                 else model.no_sync()
             )
             with sync, amp_ctx:
-                logits = model(x)
+                logits = model(x, n_loops=n_loops)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, vocab_size), y.view(-1)
                 )
@@ -526,6 +638,9 @@ def main():
         else:
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        # Shift MoE router biases toward under-used experts (all ranks, since
+        # the expert load counts are all-reduced inside).
+        raw_model.update_router_biases(router_bias_rate)
         step += 1
 
         if master and step % log_every == 0:
@@ -534,10 +649,21 @@ def main():
             tokens_seen = step * global_batch_tok
             logger.info(
                 f"step {step:6d}/{total_steps} | loss {loss_accum:.4f} "
-                f"| gnorm {float(grad_norm):.2f} | lr {cur_lr:.2e} "
+                f"| gnorm {float(grad_norm):.2f} | lr {cur_lr:.2e} | loops {n_loops} "
                 f"| {tok_per_sec / 1e6:.2f}M tok/s "
                 f"| {tokens_seen / 1e9:.1f}B tokens seen"
             )
+            t0 = time.perf_counter()
+
+        if step % eval_every == 0 and val_batches:
+            val_loss, val_ppl = evaluate(
+                model, val_batches, vocab_size, max_loops, eval_device, amp_ctx, ddp
+            )
+            if master:
+                logger.info(
+                    f"eval  step {step:6d} | val_loss {val_loss:.4f} | val_ppl {val_ppl:.2f} "
+                    f"| loops {max_loops}"
+                )
             t0 = time.perf_counter()
 
         if step % ckpt_every == 0:
